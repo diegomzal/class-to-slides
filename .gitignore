@@ -1,0 +1,16 @@
+# outputs and media
+output/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.zip
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# secrets
+.env
