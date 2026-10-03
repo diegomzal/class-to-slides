@@ -36,6 +36,9 @@ from pathlib import Path
 WHISPER_MODEL_MLX = "mlx-community/whisper-large-v3-turbo"   # Apple Silicon
 WHISPER_MODEL_CT2 = "large-v3-turbo"                         # faster-whisper (Linux / Windows / Intel Mac)
 DEFAULT_AUDIENCE = "a motivated learner who is new to this subject"
+DEFAULT_SLIDE_IMAGES = 6   # target number of lecture frames shown in the slides
+# Bump these when a prompt changes, so existing runs regenerate the affected step automatically
+PROMPT_VERSION = {"analysis": 2, "documents": 3}
 MAX_FRAMES = 80
 ANALYSIS_WIDTH = 480   # frames are analyzed downscaled; only the selected ones are saved full-size
 API_IMAGE_SIDE = 1280  # longest side of frames sent to the model
@@ -353,8 +356,9 @@ Write an analysis in {ctx['output_language']}, in Markdown, with these sections:
    ambiguous, say so; do not invent.
 3. **Line of argument**: how each idea leads to the next, including steps the lecturer skipped or
    treated as obvious.
-4. **Useful frames**: table `file | what it shows | what it is useful for`. Only frames that add
-   something (diagrams, a full board, a key slide); ignore duplicates, blurry or covered ones.
+4. **Useful frames**: table `file | what it shows | topic it illustrates`, best first. Include the
+   frames worth showing to a student (full boards with key derivations, diagrams, figures, key
+   slides), aiming for at least one per main topic; skip duplicates, blurry or covered ones.
 5. **Transcript corrections**: terms or names the speech recognition probably got wrong.
 6. **Likely points of confusion**: what will probably be hard to understand, and why.
 """})
@@ -404,8 +408,15 @@ size: 16:9
 Separate slides with `---`. Structure: title slide, prerequisites (brief), one block per topic
 (intuition → precise explanation → example), step-by-step walkthroughs where the lecturer skipped
 steps, a final summary and 3-5 review questions. At most ~8 lines per slide. Rewrite formulas in
-LaTeX and code in code blocks instead of pasting photos of the board; use images only for diagrams
-or figures, with `![h:380](frames/NAME.jpg)`, and ONLY names listed in the useful-frames table.
+LaTeX and code in code blocks so they are readable.
+
+Show the lecture itself: include about {ctx['slide_images']} frames from the useful-frames table (fewer
+only if the table has fewer), spread across the topics, at most one per slide. Put each frame on the
+slide whose content it supports, as the FIRST line of that slide, using this split layout:
+`![bg right:42% contain](frames/NAME.jpg)`. The text beside an image fits about 5 lines; if the
+content is longer, continue it on the next slide. Never drop or shorten content to make room for an
+image: images are added on top of the full content. Use ONLY file names that appear in the
+useful-frames table.
 </slides>
 """
     text = ask_llm(client, model, [{"type": "text", "text": prompt}], max_tokens=32000)
@@ -414,7 +425,24 @@ or figures, with `![h:380](frames/NAME.jpg)`, and ONLY names listed in the usefu
         if not m:
             (out_dir / "_raw_response.md").write_text(text)
             sys.exit(f"Could not find <{key}> in the response; see _raw_response.md")
-        path.write_text(m.group(1).strip() + "\n")
+        body = m.group(1).strip() + "\n"
+        if key == "slides":
+            body = drop_missing_images(body, out_dir)
+        path.write_text(body)
+
+
+def drop_missing_images(md, out_dir):
+    """Remove image lines that point to frames that don't exist (the model invented a name)."""
+    def ok(line):
+        refs = re.findall(r"\(frames/([^)\s]+)\)", line)
+        missing = [r for r in refs if not (out_dir / "frames" / r).exists()]
+        for r in missing:
+            print(f"  ! slides referenced a frame that doesn't exist, removed: {r}")
+        return not missing
+    lines = [l for l in md.splitlines() if ok(l)]
+    used = sum(len(re.findall(r"\(frames/", l)) for l in lines)
+    print(f"   slides use {used} lecture frame(s)")
+    return "\n".join(lines) + "\n"
 
 
 # ---------- 8. Render ----------
@@ -490,6 +518,9 @@ See README.md for setup.""")
         "comma-separated names/terms the transcription should spell right, "
         'e.g. "Schrödinger, Hamiltonian, Hilbert space"')
 
+    g.add_argument("--slide-images", type=int, default=DEFAULT_SLIDE_IMAGES, metavar="N", help=
+        f"about how many lecture frames to show in the slides (default: {DEFAULT_SLIDE_IMAGES})")
+
     g = ap.add_argument_group("language")
     g.add_argument("--lecture-language", metavar="CODE", help=
         "spoken language as a code: en, es, it, fr… (default: auto-detect)")
@@ -535,7 +566,7 @@ See README.md for setup.""")
     an_model, tx_model = args.analysis_model or def_an, args.text_model or def_tx
     cfg = MODES[args.mode]
     ctx = {"subject": args.subject, "audience": args.audience, "vocab": args.vocab,
-           "lecture_language": args.lecture_language,
+           "lecture_language": args.lecture_language, "slide_images": args.slide_images,
            "output_language": args.output_language or "the same language as the lecture"}
 
     out_dir = Path(args.out) / slugify(args.title)
@@ -548,8 +579,10 @@ See README.md for setup.""")
     current = {
         2: {"lecture_language": args.lecture_language, "subject": args.subject, "vocab": args.vocab},
         3: {"mode": args.mode},
-        4: {"analysis_model": an_model, "subject": args.subject, "output_language": ctx["output_language"]},
-        5: {"text_model": tx_model, "audience": args.audience},
+        4: {"analysis_model": an_model, "subject": args.subject, "output_language": ctx["output_language"],
+            "analysis_prompt": PROMPT_VERSION["analysis"]},
+        5: {"text_model": tx_model, "audience": args.audience, "slide_images": args.slide_images,
+            "documents_prompt": PROMPT_VERSION["documents"]},
     }
     redo = set()
     if args.from_step:
@@ -557,7 +590,9 @@ See README.md for setup.""")
     for step, values in current.items():
         if args.frames_only and step != 3:
             continue
-        if any(k in meta and meta[k] != v for k, v in values.items()):
+        # runs made before prompt versioning count as version 1
+        old = {k: meta.get(k, 1 if k.endswith("_prompt") and meta else None) for k in values}
+        if any(old[k] is not None and old[k] != v for k, v in values.items()):
             redo |= DOWNSTREAM[step]
     invalidate(out_dir, frames_dir, audio_dir, redo)
     for step, values in current.items():
